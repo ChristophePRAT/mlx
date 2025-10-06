@@ -205,6 +205,88 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "scaled_dot_product_attention_with_output_attentions",
+      [](const mx::array& queries,
+         const mx::array& keys,
+         const mx::array& values,
+         const float scale,
+         const std::variant<std::monostate, std::string, mx::array>& mask,
+         mx::StreamOrDevice s) {
+        bool has_mask = !std::holds_alternative<std::monostate>(mask);
+        bool has_str_mask =
+            has_mask && std::holds_alternative<std::string>(mask);
+        bool has_arr_mask = has_mask && std::holds_alternative<mx::array>(mask);
+
+        if (has_mask) {
+          if (has_str_mask) {
+            auto mask_str = std::get<std::string>(mask);
+            if (mask_str != "causal") {
+              std::ostringstream msg;
+              msg << "[scaled_dot_product_attention_with_output_attentions] invalid mask option '"
+                  << mask_str << "'. Must be 'causal', or an array.";
+              throw std::invalid_argument(msg.str());
+            }
+            return mx::fast::scaled_dot_product_attention(
+                queries, keys, values, scale, mask_str, {}, s);
+          } else {
+            auto mask_arr = std::get<mx::array>(mask);
+            return mx::fast::scaled_dot_product_attention(
+                queries, keys, values, scale, "", {mask_arr}, s);
+          }
+
+        } else {
+          return mx::fast::scaled_dot_product_attention(
+              queries, keys, values, scale, "", {}, s);
+        }
+      },
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "mask"_a = nb::none(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def scaled_dot_product_attention_with_output_attentions(q: array, k: array, v: array, *, scale: float,  mask: Union[None, str, array] = None, stream: Union[None, Stream, Device] = None) -> (array, array)"),
+      R"pbdoc(
+        A fast implementation of multi-head attention: ``O = softmax(Q @ K.T, dim=-1) @ V, softmax(Q @ K.T, dim=-1)`` with the attentions.
+
+        Supports:
+
+        * `Multi-Head Attention <https://arxiv.org/abs/1706.03762>`_
+        * `Grouped Query Attention <https://arxiv.org/abs/2305.13245>`_
+        * `Multi-Query Attention <https://arxiv.org/abs/1911.02150>`_
+
+        Note: The softmax operation is performed in ``float32`` regardless of
+        the input precision.
+
+        Note: For Grouped Query Attention and Multi-Query Attention, the ``k``
+        and ``v`` inputs should not be pre-tiled to match ``q``.
+
+        In the following the dimensions are given by:
+
+        * ``B``: The batch size.
+        * ``N_q``: The number of query heads.
+        * ``N_kv``: The number of key and value heads.
+        * ``T_q``: The number of queries per example.
+        * ``T_kv``: The number of keys and values per example.
+        * ``D``: The per-head dimension.
+
+        Args:
+            q (array): Queries with shape ``[B, N_q, T_q, D]``.
+            k (array): Keys with shape ``[B, N_kv, T_kv, D]``.
+            v (array): Values with shape ``[B, N_kv, T_kv, D]``.
+            scale (float): Scale for queries (typically ``1.0 / sqrt(q.shape(-1)``)
+            mask (Union[None, str, array], optional): A causal, boolean or additive
+               mask to apply to the query-key scores. The mask can have at most 4
+               dimensions and must be broadcast-compatible with the shape
+               ``[B, N, T_q, T_kv]``. If an additive mask is given its type must
+               promote to the promoted type of ``q``, ``k``, and ``v``.
+        Returns:
+            (array, array): The output multi-head attention and the attention
+      )pbdoc");
+
+  m.def(
       "metal_kernel",
       [](const std::string& name,
          const std::vector<std::string>& input_names,

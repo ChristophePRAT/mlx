@@ -3,6 +3,8 @@
 #include <iostream>
 #include <numeric>
 #include <regex>
+#include <utility>
+#include <vector>
 
 #include "mlx/backend/common/compiled.h"
 #include "mlx/fast.h"
@@ -781,6 +783,225 @@ array scaled_dot_product_attention(
   }
   return fallback(inputs)[0];
 }
+std::pair<array, array> scaled_dot_product_attention_with_output_attentions(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    const std::string& mask_mode /* = "" */,
+    const std::vector<array>& mask_arrs /* = {} */,
+    StreamOrDevice s /* = {}*/) {
+  for (const auto& tensor : {queries, keys, values}) {
+    if (tensor.ndim() != 4) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] input with shape "
+          << tensor.shape() << " expected to be rank 4";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  // Check valid mask
+  if (mask_mode != "" && mask_mode != "causal" && mask_mode != "array") {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention] Invalid mask_mode " << mask_mode
+        << ". mask_mode must be 'causal', 'array' or ''.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  bool do_causal = false;
+  bool has_mask = false;
+  bool has_arr_mask = false;
+  bool has_bool_mask = false;
+
+  if (mask_mode == "causal") {
+    has_mask = true;
+    do_causal = true;
+
+    if (!mask_arrs.empty()) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] Invalid mask_arrs for mask_mode "
+          << "'casusal'. No array masks supported.";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+
+  if (mask_mode == "array" || (mask_mode == "" && !mask_arrs.empty())) {
+    if (mask_arrs.size() != 1) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] Invalid mask_arrs for mask_mode "
+          << "'" << mask_mode << "'. Only 1 mask array is supported, got "
+          << mask_arrs.size() << "arrays.";
+      throw std::invalid_argument(msg.str());
+    }
+
+    has_mask = true;
+    has_arr_mask = true;
+    has_bool_mask = mask_arrs[0].dtype() == bool_;
+  }
+
+  if (has_arr_mask && (mask_arrs[0]).ndim() > 4) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention] the mask with shape "
+        << mask_arrs[0].shape() << " expected to have at most rank 4.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  const size_t batch_dim = queries.shape(0);
+  for (const auto& tensor : {keys, values}) {
+    if (tensor.shape(0) != batch_dim) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] mismatching batch dimension for input with shape "
+          << tensor.shape() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+
+  // Q, K must have matching last dims (d_k aka 'head_dim');
+  if (queries.shape(-1) != keys.shape(-1)) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention] query, keys expected to have matching last dimension; found query shape "
+        << queries.shape() << " for keys shape " << keys.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // K, V must have matching number of heads (n_kv_heads);
+  auto n_q_heads = queries.shape(-3);
+  auto n_kv_heads = keys.shape(-3);
+
+  if (keys.shape(-3) != values.shape(-3)) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention] keys, values expected to have matching n_kv_heads; found keys with n_heads "
+        << keys.shape(-3) << " for values with n_heads " << values.shape(-3)
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // n_heads % n_kv_heads == 0; n_heads >= 1, n_kv_heads >= 1.
+  if (n_q_heads % n_kv_heads != 0) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention] n_heads must be a multiple of n_kv_heads, found n_heads "
+        << n_q_heads << " for n_kv_heads " << n_kv_heads << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto final_type = result_type(queries, keys, values);
+  if (!issubdtype(final_type, floating)) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention] Received unsupported type "
+        << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto q = astype(queries, final_type, s);
+  auto k = astype(keys, final_type, s);
+  auto v = astype(values, final_type, s);
+
+  auto fallback = [scale, final_type, n_q_heads, n_kv_heads, do_causal, s](
+                      const std::vector<array>& inputs) {
+    auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
+    int n_repeats = n_q_heads / n_kv_heads;
+    int B = q.shape(0);
+    int L = q.shape(2);
+    auto k = inputs[1];
+    auto v = inputs[2];
+    if (n_repeats > 1) {
+      q = unflatten(q, 1, {n_kv_heads, n_repeats}, s);
+      k = expand_dims(k, 2, s);
+      v = expand_dims(v, 2, s);
+    }
+    auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
+    if (inputs.size() > 3 || do_causal) {
+      // Mask must be broadcast-compatible with [B, n_q_heads, L_q, L_kv]
+      auto mask = inputs.back();
+
+      if (do_causal) {
+        int kL = k.shape(-2);
+        int qL = q.shape(-2);
+        int q_off = (kL - qL) < 0 ? 0 : (kL - qL);
+        auto q_idx = arange(q_off, q_off + qL, s);
+        auto k_idx = arange(0, kL, s);
+        q_idx = expand_dims(q_idx, 1, s);
+        k_idx = expand_dims(k_idx, 0, s);
+        mask = greater_equal(q_idx, k_idx, s);
+      }
+
+      if (n_repeats > 1 && mask.ndim() >= 3) {
+        if (mask.shape(-3) == 1) {
+          mask = expand_dims(mask, -3, s);
+        } else {
+          mask = unflatten(mask, -3, {n_kv_heads, n_repeats}, s);
+        }
+      }
+      if (mask.dtype() == bool_) {
+        scores = where(
+            mask, scores, array(finfo(scores.dtype()).min, scores.dtype()));
+      } else {
+        scores = add(scores, mask, s);
+      }
+    }
+    scores = softmax(scores, std::vector<int>{-1}, true, s);
+    auto out = matmul(scores, v, s);
+    if (n_repeats > 1) {
+      out = flatten(out, 1, 2, s);
+    }
+    return std::make_pair<std::vector<array>{out}, std::vector<array>{scores}>;
+  };
+
+  auto stream = to_stream(s);
+  const int value_head_dim = v.shape(-1);
+  const int query_head_dim = q.shape(-1);
+  const int query_sequence_length = q.shape(2);
+  const int key_sequence_length = k.shape(2);
+
+  const bool sdpa_vector_supported_head_dim =
+      query_head_dim == value_head_dim &&
+      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
+       query_head_dim == 256);
+  const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
+      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128);
+
+  const bool sdpa_full_supported_mask = !has_mask || has_arr_mask ||
+      (query_sequence_length <= key_sequence_length && do_causal);
+
+  const bool supports_sdpa_full = sdpa_full_supported_mask &&
+      sdpa_full_supported_head_dim && stream.device == Device::gpu;
+
+  const bool supports_sdpa_vector = (query_sequence_length <= 8) &&
+      (query_sequence_length <= key_sequence_length) &&
+      sdpa_vector_supported_head_dim && stream.device == Device::gpu;
+
+  const bool implementation_supports_use_case =
+      supports_sdpa_full || supports_sdpa_vector;
+
+  std::vector<array> inputs = {q, k, v};
+  if (has_arr_mask) {
+    // Check type
+    auto mask_arr = mask_arrs[0];
+    has_bool_mask = mask_arr.dtype() == bool_;
+    if (promote_types(mask_arr.dtype(), final_type) != final_type) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] Mask type must promote to output type. "
+          << final_type << ".";
+      throw std::invalid_argument(msg.str());
+    } else if (!has_bool_mask) {
+      mask_arr = astype(mask_arr, final_type, stream);
+    }
+    // Broadcast mask
+    auto mask_shape = queries.shape();
+    mask_shape.back() = keys.shape(-2);
+    inputs.push_back(broadcast_to(mask_arr, mask_shape, stream));
+  }
+  if (!detail::in_grad_tracing() && implementation_supports_use_case) {
+    auto out_shape = Shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
+    return array(
+        std::move(out_shape),
+        final_type,
+        std::make_shared<ScaledDotProductAttention>(
+            stream, fallback, scale, do_causal),
+        std::move(inputs));
+  }
+  return fallback(inputs)[0];
+}
+
 
 bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
   const ScaledDotProductAttention& a_other =

@@ -52,6 +52,15 @@ array scaled_dot_product_attention(
     const std::vector<array>& mask_arrs = {},
     StreamOrDevice s = {});
 
+std::pair<array, array> scaled_dot_product_attention_with_output_attentions(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    const std::string& mask_mode = "",
+    const std::vector<array>& mask_arrs = {},
+    StreamOrDevice s = {});
+
 std::tuple<array, array, array> affine_quantize(
     const array& w,
     int group_size = 64,
